@@ -96,6 +96,15 @@ void vReadTemperatureSensor(TemperatureSensor* Sensor)
     Sensor->Temperature = ((RawTemperature / (float)(1 << 20)) * 200.f) - 50.f;
 }
 
+long int iGetFileSize(FILE* File)
+{
+    long int CurrentPos = ftell(File);
+    fseek(File, 0, SEEK_END);
+    long int FileSize = ftell(File);
+    fseek(File, CurrentPos, SEEK_SET);
+    return FileSize;
+}
+
 void app_main(void)
 {
     esp_vfs_spiffs_conf_t SpiffsConfig = {
@@ -107,7 +116,7 @@ void app_main(void)
 
     esp_vfs_spiffs_register(&SpiffsConfig);
 
-    FILE* LogFile = fopen("/spiffs/log.bin", "w");
+    FILE* LogFile = fopen("/spiffs/log.bin", "rb+");
 
     TemperatureSensor Sensor;
     bool InitStatus = bInitTemperatureSensor(&Sensor, TEMP_SCL, TEMP_SDA, TEMP_ADR);
@@ -119,30 +128,130 @@ void app_main(void)
         esp_vfs_spiffs_unregister(NULL);
         return;
     }
-    while (1)
+    if (iGetFileSize(LogFile) == 0)
     {
-        struct timeval Now;
-        _gettimeofday_r(NULL, &Now, NULL);
-
-        int64_t MicrosecondEpoch = (int64_t)Now.tv_sec * 1000000L + (int64_t)Now.tv_usec;
-        int64_t MillisecondEpoch = MicrosecondEpoch / 1000L;
-
-        vReadTemperatureSensor(&Sensor);
-
-        unsigned char BufferToWrite[16];
-
-        *((unsigned long long*)(BufferToWrite)) = MillisecondEpoch;
-        *((float*)(BufferToWrite + 8)) = Sensor.Temperature;
-        *((float*)(BufferToWrite + 12)) = Sensor.Humidity;
-
-        fwrite(BufferToWrite, sizeof(BufferToWrite[0]), sizeof(BufferToWrite), LogFile);
-        g_BytesWrittenToFile += sizeof(BufferToWrite);
-
-        printf("Time: %llu    Temp.: %.2f    Humidity: %.2f\n", MillisecondEpoch, Sensor.Temperature, Sensor.Humidity);
-
-        if (getchar() == 'q' || g_BytesWrittenToFile > MAX_BYTES_WRITTEN) 
+        printf("Sampling\n");
+        while (1)
         {
-            break;
+            struct timeval Now;
+            _gettimeofday_r(NULL, &Now, NULL);
+
+            int64_t MicrosecondEpoch = (int64_t)Now.tv_sec * 1000000L + (int64_t)Now.tv_usec;
+            int64_t MillisecondEpoch = MicrosecondEpoch / 1000L;
+
+            vReadTemperatureSensor(&Sensor);
+
+            unsigned char BufferToWrite[16];
+
+            *((unsigned long long*)(BufferToWrite)) = MillisecondEpoch;
+            *((float*)(BufferToWrite + 8)) = Sensor.Temperature;
+            *((float*)(BufferToWrite + 12)) = Sensor.Humidity;
+
+            fwrite(BufferToWrite, sizeof(BufferToWrite[0]), sizeof(BufferToWrite), LogFile);
+            g_BytesWrittenToFile += sizeof(BufferToWrite);
+
+            printf("Time: %llu    Temp.: %.2f    Humidity: %.2f\n", MillisecondEpoch, Sensor.Temperature, Sensor.Humidity);
+
+            if (getchar() == 'q' || g_BytesWrittenToFile > MAX_BYTES_WRITTEN) 
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        long int FileSize = iGetFileSize(LogFile);
+        long int AmountOfEntries = FileSize / 16;
+        printf("File size: %ld bytes, Amount of entries: %ld\n", FileSize, AmountOfEntries);
+        printf("Enter command (q to quit, r to read):\n> ");
+        
+        while (1)
+        {
+            char Command[16];
+            size_t CollectedChars = 0;
+            bool BreakedEarly = false;
+            while (CollectedChars < sizeof(Command) - 1)
+            {
+                int c = getchar();
+                if (c != EOF)
+                {
+                    Command[CollectedChars++] = (char)c;
+                }
+                if (c == '\n')
+                {
+                    BreakedEarly = true;
+                    break;
+                }
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+            }
+            Command[CollectedChars] = '\0';
+            if (BreakedEarly)
+            {
+                Command[CollectedChars - 1] = '\0';
+            }
+            printf("%s\n", Command);
+            if (Command[0] == 'q')
+            {
+                break;
+            }
+            else if (Command[0] == 'r')
+            {
+                unsigned int EntryIndex = 0;
+                if (sscanf(Command, "r %d", &EntryIndex) == 1)
+                {
+                    EntryIndex = EntryIndex - 1;
+                    unsigned char BufferToRead[16];
+                    fseek(LogFile, EntryIndex * sizeof(BufferToRead), SEEK_SET);
+                    size_t ReadBytes = fread(BufferToRead, sizeof(BufferToRead[0]), sizeof(BufferToRead), LogFile);
+                    if (ReadBytes != sizeof(BufferToRead))
+                    {
+                        printf("Failed to read entry %d\n> ", ++EntryIndex);
+                        continue;
+                    }
+                    int64_t MillisecondEpoch = *((int64_t*)(BufferToRead));
+                    float Temperature = *((float*)(BufferToRead + 8));
+                    float Humidity = *((float*)(BufferToRead + 12));
+                    printf("Entry %d: Time: %lld    Temp.: %.2f    Humidity: %.2f\n", 
+                            (int)++EntryIndex, MillisecondEpoch, Temperature, Humidity);
+                }
+                else
+                {
+                    for (size_t CurrentIdx = 0; CurrentIdx < AmountOfEntries; CurrentIdx++)
+                    {
+                        unsigned char BufferToRead[16];
+                        fseek(LogFile, CurrentIdx * sizeof(BufferToRead), SEEK_SET);
+                        size_t ReadBytes = fread(BufferToRead, sizeof(BufferToRead[0]), sizeof(BufferToRead), LogFile);
+                        if (ReadBytes != sizeof(BufferToRead))
+                        {
+                            printf("Failed to read entry %d\n", CurrentIdx);
+                            break;
+                        }
+                        int64_t MillisecondEpoch = *((int64_t*)(BufferToRead));
+                        float Temperature = *((float*)(BufferToRead + 8));
+                        float Humidity = *((float*)(BufferToRead + 12));
+                        printf("Entry %d: Time: %lld    Temp.: %.2f    Humidity: %.2f\n", 
+                               (int)CurrentIdx, MillisecondEpoch, Temperature, Humidity);
+                    }
+                }
+                printf("> ");
+            }
+            else if (Command[0] == 'c')
+            {
+                fclose(LogFile);
+                LogFile = fopen("/spiffs/log.bin", "wb+");
+                if (LogFile == NULL)
+                {
+                    printf("Failed to clear log file!\n");
+                    break;
+                }
+                g_BytesWrittenToFile = 0;
+                printf("Log file cleared.\n");
+                break;
+            }
+            else
+            {
+                printf("Unknown command: %s\n", Command);
+            }
         }
     }
 
