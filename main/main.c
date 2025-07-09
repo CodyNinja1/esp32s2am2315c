@@ -6,9 +6,12 @@
 #include "esp_mac.h"
 #include "esp_spiffs.h"
 
-#define TEMP_SDA 20
-#define TEMP_SCL 21
+#define I2C_SDA 20
+#define I2C_SCL 21
+
 #define TEMP_ADR 0x38
+
+#define RTC_ADR 0x28
 
 #define MAX_BYTES_WRITTEN 524288
 
@@ -21,12 +24,48 @@ typedef struct
     float Humidity;
 } TemperatureSensor;
 
-uint32_t g_BytesWrittenToFile = 0;
+typedef struct
+{
+    i2c_master_dev_handle_t hDevice;
+    unsigned long long Epoch;
+} RtcDevice;
 
-bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t SCL, uint8_t SDA, uint8_t Address)
+uint32_t g_BytesWrittenToFile = 0;
+i2c_master_bus_handle_t g_hBus;
+
+bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t Address)
 {
     Wait(200);
 
+    i2c_device_config_t DeviceConfig = {
+        .device_address = Address,
+        .scl_speed_hz = 100000
+    };
+
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_hBus, &DeviceConfig, &(Sensor->hDevice)));
+    
+    uint8_t Status = 0;
+    Status = 0x71;
+
+    ESP_ERROR_CHECK(i2c_master_transmit_receive(Sensor->hDevice, &Status, 1, &Status, 1, -1));
+
+    return (Status & 0x18) == 0x18;
+}
+
+bool bInitRtcDevice(RtcDevice* Rtc, uint8_t Address)
+{
+    i2c_device_config_t DeviceConfig = {
+        .device_address = Address,
+        .scl_speed_hz = 100000
+    };
+
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_hBus, &DeviceConfig, &(Rtc->hDevice)));
+
+    return true;
+}
+
+void vInitI2CBus(uint8_t SCL, uint8_t SDA)
+{
     i2c_master_bus_config_t I2CBusConfig = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = 0,
@@ -35,23 +74,8 @@ bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t SCL, uint8_t SDA,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true
     };
-    i2c_master_bus_handle_t hBus;
 
-    ESP_ERROR_CHECK(i2c_new_master_bus(&I2CBusConfig, &hBus));
-
-    i2c_device_config_t DeviceConfig = {
-        .device_address = Address,
-        .scl_speed_hz = 100000
-    };
-
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(hBus, &DeviceConfig, &(Sensor->hDevice)));
-    
-    uint8_t Status = 0;
-    Status = 0x71;
-
-    ESP_ERROR_CHECK(i2c_master_transmit_receive(Sensor->hDevice, &Status, 1, &Status, 1, -1));
-
-    return (Status & 0x18) == 0x18;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&I2CBusConfig, &g_hBus));
 }
 
 void vReadTemperatureSensor(TemperatureSensor* Sensor)
@@ -96,6 +120,19 @@ void vReadTemperatureSensor(TemperatureSensor* Sensor)
     Sensor->Temperature = ((RawTemperature / (float)(1 << 20)) * 200.f) - 50.f;
 }
 
+void vReadRtcDevice(RtcDevice* Rtc)
+{
+    uint8_t buffer[8] = {0x00, 0x00, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00};
+    
+    ESP_ERROR_CHECK(i2c_master_transmit(Rtc->hDevice, buffer, 1, -1));
+    
+    ESP_ERROR_CHECK(i2c_master_receive(Rtc->hDevice, buffer, 8, -1));
+
+    printf("RTC Read: %02x\n",
+           buffer[0]);
+}
+
 long int iGetFileSize(FILE* File)
 {
     long int CurrentPos = ftell(File);
@@ -119,15 +156,30 @@ void app_main(void)
     FILE* LogFile = fopen("/spiffs/log.bin", "rb+");
 
     TemperatureSensor Sensor;
-    bool InitStatus = bInitTemperatureSensor(&Sensor, TEMP_SCL, TEMP_SDA, TEMP_ADR);
-    printf("Init status: %d\n", InitStatus);
-    if (!InitStatus)
+    RtcDevice Rtc;
+
+    vInitI2CBus(I2C_SCL, I2C_SDA);
+
+    bool TempInitStatus = bInitTemperatureSensor(&Sensor, TEMP_ADR);
+    printf("Temperature sensor status: %d\n", TempInitStatus);
+    if (!TempInitStatus)
     {
         printf("Failed to initialize sensor!\n");
         fclose(LogFile);
         esp_vfs_spiffs_unregister(NULL);
         return;
     }
+
+    bool RtcInitStatus = bInitRtcDevice(&Rtc, RTC_ADR);
+    printf("RTC sensor status: %d\n", RtcInitStatus);
+    if (!RtcInitStatus)
+    {
+        printf("Failed to initialize RTC!\n");
+        fclose(LogFile);
+        esp_vfs_spiffs_unregister(NULL);
+        return;
+    }
+
     if (iGetFileSize(LogFile) == 0)
     {
         printf("Sampling\n");
@@ -160,10 +212,12 @@ void app_main(void)
     }
     else
     {
+        // LABEL: Debug
+        vReadRtcDevice(&Rtc);
         long int FileSize = iGetFileSize(LogFile);
         long int AmountOfEntries = FileSize / 16;
         printf("File size: %ld bytes, Amount of entries: %ld\n", FileSize, AmountOfEntries);
-        printf("Enter command (q to quit, r to read):\n> ");
+        printf("Enter command:\n> ");
         
         while (1)
         {
@@ -172,24 +226,25 @@ void app_main(void)
             bool BreakedEarly = false;
             while (CollectedChars < sizeof(Command) - 1)
             {
-                int c = getchar();
-                if (c != EOF)
+                int Char = getchar();
+                if (Char != EOF)
                 {
-                    Command[CollectedChars++] = (char)c;
+                    printf("%c", (char)Char);
+                    Command[CollectedChars++] = (char)Char;
                 }
-                if (c == '\n')
+                if (Char == '\n')
                 {
                     BreakedEarly = true;
                     break;
                 }
-                vTaskDelay(10 / portTICK_PERIOD_MS);
+                Wait(10);
             }
             Command[CollectedChars] = '\0';
             if (BreakedEarly)
             {
                 Command[CollectedChars - 1] = '\0';
             }
-            printf("%s\n", Command);
+            // printf("%s\n", Command);
             if (Command[0] == 'q')
             {
                 break;
@@ -250,7 +305,7 @@ void app_main(void)
             }
             else
             {
-                printf("Unknown command: %s\n", Command);
+                printf("Unknown command: %s\n> ", Command);
             }
         }
     }
