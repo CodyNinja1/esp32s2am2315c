@@ -6,12 +6,15 @@
 #include "esp_mac.h"
 #include "esp_spiffs.h"
 
-#define I2C_SDA 20
-#define I2C_SCL 21
+#define TEMP_I2C_SDA 20
+#define TEMP_I2C_SCL 21
+
+#define RTC_I2C_SDA 33
+#define RTC_I2C_SCL 34
 
 #define TEMP_ADR 0x38
 
-#define RTC_ADR 0x28
+#define RTC_ADR 0x68
 
 #define MAX_BYTES_WRITTEN 524288
 
@@ -31,7 +34,8 @@ typedef struct
 } RtcDevice;
 
 uint32_t g_BytesWrittenToFile = 0;
-i2c_master_bus_handle_t g_hBus;
+i2c_master_bus_handle_t hBusTemperature;
+i2c_master_bus_handle_t hBusRtc;
 
 bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t Address)
 {
@@ -42,7 +46,7 @@ bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t Address)
         .scl_speed_hz = 100000
     };
 
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_hBus, &DeviceConfig, &(Sensor->hDevice)));
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(hBusTemperature, &DeviceConfig, &(Sensor->hDevice)));
     
     uint8_t Status = 0;
     Status = 0x71;
@@ -52,6 +56,11 @@ bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t Address)
     return (Status & 0x18) == 0x18;
 }
 
+void vDestroyTemperatureSensor(TemperatureSensor* Sensor)
+{
+    ESP_ERROR_CHECK(i2c_master_bus_rm_device(Sensor->hDevice));
+}
+
 bool bInitRtcDevice(RtcDevice* Rtc, uint8_t Address)
 {
     i2c_device_config_t DeviceConfig = {
@@ -59,23 +68,38 @@ bool bInitRtcDevice(RtcDevice* Rtc, uint8_t Address)
         .scl_speed_hz = 100000
     };
 
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_hBus, &DeviceConfig, &(Rtc->hDevice)));
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(hBusRtc, &DeviceConfig, &(Rtc->hDevice)));
 
     return true;
 }
 
-void vInitI2CBus(uint8_t SCL, uint8_t SDA)
+void vDestroyRtcDevice(RtcDevice* Rtc)
+{
+    ESP_ERROR_CHECK(i2c_master_bus_rm_device(Rtc->hDevice));
+}
+
+void vInitI2CBus(uint8_t SCL, uint8_t SDA, i2c_master_bus_handle_t* hBus)
 {
     i2c_master_bus_config_t I2CBusConfig = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = 0,
+        .i2c_port = -1,
         .scl_io_num = SCL,
         .sda_io_num = SDA,
         .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true
+        .flags.enable_internal_pullup = false
     };
 
-    ESP_ERROR_CHECK(i2c_new_master_bus(&I2CBusConfig, &g_hBus));
+    ESP_ERROR_CHECK(i2c_new_master_bus(&I2CBusConfig, hBus));
+}
+
+void vResetI2CBus(i2c_master_bus_handle_t hBus)
+{
+    ESP_ERROR_CHECK(i2c_master_bus_reset(hBus));
+}
+
+void vDestroyI2CBus(i2c_master_bus_handle_t hBus)
+{
+    ESP_ERROR_CHECK(i2c_del_master_bus(hBus));
 }
 
 void vReadTemperatureSensor(TemperatureSensor* Sensor)
@@ -120,17 +144,38 @@ void vReadTemperatureSensor(TemperatureSensor* Sensor)
     Sensor->Temperature = ((RawTemperature / (float)(1 << 20)) * 200.f) - 50.f;
 }
 
+uint8_t BcdToBinary(uint8_t Bcd)
+{
+    return Bcd - 6 * (Bcd >> 4);
+}
+
 void vReadRtcDevice(RtcDevice* Rtc)
 {
+    struct tm t;
+
     uint8_t buffer[8] = {0x00, 0x00, 0x00, 0x00,
                          0x00, 0x00, 0x00, 0x00};
     
     ESP_ERROR_CHECK(i2c_master_transmit(Rtc->hDevice, buffer, 1, -1));
     
-    ESP_ERROR_CHECK(i2c_master_receive(Rtc->hDevice, buffer, 8, -1));
+    ESP_ERROR_CHECK(i2c_master_receive(Rtc->hDevice, buffer, 7, -1));
 
-    printf("RTC Read: %02x\n",
-           buffer[0]);
+    // uint8_t Years = BcdToBinary(buffer[6]) + 100;
+    // // uint8_t Months = BcdToBinary(buffer[5]);
+    // uint8_t Days = BcdToBinary(buffer[4]);
+    // uint8_t Hours = BcdToBinary(buffer[2]);
+    // uint8_t Minutes = BcdToBinary(buffer[1]);
+    // uint8_t Seconds = BcdToBinary(buffer[0] & 0x7f);
+    
+    t.tm_year = 2000 + BcdToBinary(buffer[6]) - 1900;  // Full year minus 1900
+    t.tm_mon  = BcdToBinary(buffer[5]) - 1;            // Months since January [0-11]
+    t.tm_mday = BcdToBinary(buffer[4]);
+    t.tm_hour = BcdToBinary(buffer[2]);
+    t.tm_min  = BcdToBinary(buffer[1]);
+    t.tm_sec  = BcdToBinary(buffer[0] & 0x7F);
+    t.tm_isdst = 0;  // No daylight saving time
+
+    Rtc->Epoch = mktime(&t);
 }
 
 long int iGetFileSize(FILE* File)
@@ -158,23 +203,28 @@ void app_main(void)
     TemperatureSensor Sensor;
     RtcDevice Rtc;
 
-    vInitI2CBus(I2C_SCL, I2C_SDA);
+    vInitI2CBus(TEMP_I2C_SCL, TEMP_I2C_SDA, &hBusTemperature);
 
     bool TempInitStatus = bInitTemperatureSensor(&Sensor, TEMP_ADR);
     printf("Temperature sensor status: %d\n", TempInitStatus);
     if (!TempInitStatus)
     {
         printf("Failed to initialize sensor!\n");
+        vDestroyTemperatureSensor(&Sensor);
         fclose(LogFile);
         esp_vfs_spiffs_unregister(NULL);
         return;
     }
 
+    vInitI2CBus(RTC_I2C_SCL, RTC_I2C_SDA, &hBusRtc);
+
     bool RtcInitStatus = bInitRtcDevice(&Rtc, RTC_ADR);
-    printf("RTC sensor status: %d\n", RtcInitStatus);
+    printf("RTC status: %d\n", RtcInitStatus);
     if (!RtcInitStatus)
     {
         printf("Failed to initialize RTC!\n");
+        vDestroyTemperatureSensor(&Sensor);
+        vDestroyRtcDevice(&Rtc);
         fclose(LogFile);
         esp_vfs_spiffs_unregister(NULL);
         return;
@@ -182,6 +232,7 @@ void app_main(void)
 
     if (iGetFileSize(LogFile) == 0)
     {
+        vReadRtcDevice(&Rtc);
         printf("Sampling\n");
         while (1)
         {
@@ -195,14 +246,14 @@ void app_main(void)
 
             unsigned char BufferToWrite[16];
 
-            *((unsigned long long*)(BufferToWrite)) = MillisecondEpoch;
+            *((unsigned long long*)(BufferToWrite)) = MillisecondEpoch * 1000 + Rtc.Epoch;
             *((float*)(BufferToWrite + 8)) = Sensor.Temperature;
             *((float*)(BufferToWrite + 12)) = Sensor.Humidity;
 
             fwrite(BufferToWrite, sizeof(BufferToWrite[0]), sizeof(BufferToWrite), LogFile);
             g_BytesWrittenToFile += sizeof(BufferToWrite);
 
-            printf("Time: %llu    Temp.: %.2f    Humidity: %.2f\n", MillisecondEpoch, Sensor.Temperature, Sensor.Humidity);
+            printf("Time: %llu    Temp.: %.2f    Humidity: %.2f\n", MillisecondEpoch * 1000 + Rtc.Epoch, Sensor.Temperature, Sensor.Humidity);
 
             if (getchar() == 'q' || g_BytesWrittenToFile > MAX_BYTES_WRITTEN) 
             {
@@ -212,8 +263,6 @@ void app_main(void)
     }
     else
     {
-        // LABEL: Debug
-        vReadRtcDevice(&Rtc);
         long int FileSize = iGetFileSize(LogFile);
         long int AmountOfEntries = FileSize / 16;
         printf("File size: %ld bytes, Amount of entries: %ld\n", FileSize, AmountOfEntries);
@@ -310,6 +359,10 @@ void app_main(void)
         }
     }
 
+    vDestroyTemperatureSensor(&Sensor);
+    vDestroyRtcDevice(&Rtc);
+    vDestroyI2CBus(hBusRtc);
+    vDestroyI2CBus(hBusTemperature);
     fclose(LogFile);
     esp_vfs_spiffs_unregister(NULL);
 }
