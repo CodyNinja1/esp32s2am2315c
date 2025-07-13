@@ -149,6 +149,11 @@ uint8_t BcdToBinary(uint8_t Bcd)
     return Bcd - 6 * (Bcd >> 4);
 }
 
+uint8_t BinaryToBcd(uint8_t Binary)
+{
+    return Binary + 6 * (Binary / 10);
+}
+
 void vReadRtcDevice(RtcDevice* Rtc)
 {
     struct tm t;
@@ -206,34 +211,40 @@ void app_main(void)
     vInitI2CBus(TEMP_I2C_SCL, TEMP_I2C_SDA, &hBusTemperature);
 
     bool TempInitStatus = bInitTemperatureSensor(&Sensor, TEMP_ADR);
-    printf("Temperature sensor status: %d\n", TempInitStatus);
     if (!TempInitStatus)
     {
-        printf("Failed to initialize sensor!\n");
+        printf("e0t\n");
         vDestroyTemperatureSensor(&Sensor);
         fclose(LogFile);
         esp_vfs_spiffs_unregister(NULL);
         return;
     }
+    else
+    {
+        printf("s0t\n");
+    }
 
     vInitI2CBus(RTC_I2C_SCL, RTC_I2C_SDA, &hBusRtc);
 
     bool RtcInitStatus = bInitRtcDevice(&Rtc, RTC_ADR);
-    printf("RTC status: %d\n", RtcInitStatus);
     if (!RtcInitStatus)
     {
-        printf("Failed to initialize RTC!\n");
+        printf("e0r\n");
         vDestroyTemperatureSensor(&Sensor);
         vDestroyRtcDevice(&Rtc);
         fclose(LogFile);
         esp_vfs_spiffs_unregister(NULL);
         return;
     }
+    else
+    {
+        printf("s0r\n");
+    }
+
+    vReadRtcDevice(&Rtc);
 
     if (iGetFileSize(LogFile) == 0)
     {
-        vReadRtcDevice(&Rtc);
-        printf("Sampling\n");
         while (1)
         {
             struct timeval Now;
@@ -246,40 +257,49 @@ void app_main(void)
 
             unsigned char BufferToWrite[16];
 
-            *((unsigned long long*)(BufferToWrite)) = MillisecondEpoch * 1000 + Rtc.Epoch;
+            *((unsigned long long*)(BufferToWrite)) = MillisecondEpoch + Rtc.Epoch * 1000;
             *((float*)(BufferToWrite + 8)) = Sensor.Temperature;
             *((float*)(BufferToWrite + 12)) = Sensor.Humidity;
 
             fwrite(BufferToWrite, sizeof(BufferToWrite[0]), sizeof(BufferToWrite), LogFile);
             g_BytesWrittenToFile += sizeof(BufferToWrite);
 
-            printf("Time: %llu    Temp.: %.2f    Humidity: %.2f\n", MillisecondEpoch * 1000 + Rtc.Epoch, Sensor.Temperature, Sensor.Humidity);
+            // printf("Time: %llu    Temp.: %.2f    Humidity: %.2f\n", MillisecondEpoch + Rtc.Epoch * 1000, Sensor.Temperature, Sensor.Humidity);
 
+            // Quit
             if (getchar() == 'q' || g_BytesWrittenToFile > MAX_BYTES_WRITTEN) 
             {
                 break;
+            }
+            // statUs
+            else if (getchar() == 'u')
+            {
+                printf("s0\n");
+            }
+            // Index
+            else if (getchar() == 'i')
+            {
+                printf("i%lu\n", g_BytesWrittenToFile / 16);
             }
         }
     }
     else
     {
-        long int FileSize = iGetFileSize(LogFile);
-        long int AmountOfEntries = FileSize / 16;
-        printf("File size: %ld bytes, Amount of entries: %ld\n", FileSize, AmountOfEntries);
-        printf("Enter command:\n> ");
+        int FileSize = iGetFileSize(LogFile);
+        int AmountOfEntries = FileSize / 16;
         
         while (1)
         {
-            char Command[16];
+            uint8_t Command[16];
             size_t CollectedChars = 0;
             bool BreakedEarly = false;
             while (CollectedChars < sizeof(Command) - 1)
             {
-                int Char = getchar();
-                if (Char != EOF)
+                uint8_t Char = getchar();
+                if (Char !=  0xFFu)
                 {
                     printf("%c", (char)Char);
-                    Command[CollectedChars++] = (char)Char;
+                    Command[CollectedChars++] = Char;
                 }
                 if (Char == '\n')
                 {
@@ -292,69 +312,124 @@ void app_main(void)
             if (BreakedEarly)
             {
                 Command[CollectedChars - 1] = '\0';
-            }
-            // printf("%s\n", Command);
+            } 
+            // Quit
             if (Command[0] == 'q')
             {
                 break;
             }
+            // Read
             else if (Command[0] == 'r')
             {
                 unsigned int EntryIndex = 0;
-                if (sscanf(Command, "r %d", &EntryIndex) == 1)
+                if (sscanf((char*)Command + 1, "%u", &EntryIndex) == 1 && EntryIndex < AmountOfEntries)
                 {
-                    EntryIndex = EntryIndex - 1;
-                    unsigned char BufferToRead[16];
-                    fseek(LogFile, EntryIndex * sizeof(BufferToRead), SEEK_SET);
-                    size_t ReadBytes = fread(BufferToRead, sizeof(BufferToRead[0]), sizeof(BufferToRead), LogFile);
-                    if (ReadBytes != sizeof(BufferToRead))
-                    {
-                        printf("Failed to read entry %d\n> ", ++EntryIndex);
-                        continue;
-                    }
-                    int64_t MillisecondEpoch = *((int64_t*)(BufferToRead));
-                    float Temperature = *((float*)(BufferToRead + 8));
-                    float Humidity = *((float*)(BufferToRead + 12));
-                    printf("Entry %d: Time: %lld    Temp.: %.2f    Humidity: %.2f\n", 
-                            (int)++EntryIndex, MillisecondEpoch, Temperature, Humidity);
+                    fseek(LogFile, EntryIndex * 16, SEEK_SET);
+                    unsigned char Buffer[16];
+                    fread(Buffer, sizeof(Buffer[0]), sizeof(Buffer), LogFile);
+
+                    unsigned long long Timestamp = *((unsigned long long*)(Buffer));
+                    float Temperature = *((float*)(Buffer + 8));
+                    float Humidity = *((float*)(Buffer + 12));
+
+                    printf("t%llup%.3fh%.3f\n", Timestamp, Temperature, Humidity);
                 }
                 else
                 {
-                    for (size_t CurrentIdx = 0; CurrentIdx < AmountOfEntries; CurrentIdx++)
-                    {
-                        unsigned char BufferToRead[16];
-                        fseek(LogFile, CurrentIdx * sizeof(BufferToRead), SEEK_SET);
-                        size_t ReadBytes = fread(BufferToRead, sizeof(BufferToRead[0]), sizeof(BufferToRead), LogFile);
-                        if (ReadBytes != sizeof(BufferToRead))
-                        {
-                            printf("Failed to read entry %d\n", CurrentIdx);
-                            break;
-                        }
-                        int64_t MillisecondEpoch = *((int64_t*)(BufferToRead));
-                        float Temperature = *((float*)(BufferToRead + 8));
-                        float Humidity = *((float*)(BufferToRead + 12));
-                        printf("Entry %d: Time: %lld    Temp.: %.2f    Humidity: %.2f\n", 
-                               (int)CurrentIdx, MillisecondEpoch, Temperature, Humidity);
-                    }
+                    printf("e0e0e0\n");
                 }
-                printf("> ");
             }
+            // Sample
+            else if (Command[0] == 's')
+            {
+                vReadTemperatureSensor(&Sensor);
+                struct timeval Now;
+                _gettimeofday_r(NULL, &Now, NULL);
+
+                int64_t MicrosecondEpoch = (int64_t)Now.tv_sec * 1000000L + (int64_t)Now.tv_usec;
+                int64_t MillisecondEpoch = MicrosecondEpoch / 1000L;
+
+                printf("t%llup%.3fh%.3f\n", MillisecondEpoch + Rtc.Epoch * 1000, Sensor.Temperature, Sensor.Humidity);
+            }
+            // Clear
             else if (Command[0] == 'c')
             {
                 fclose(LogFile);
                 LogFile = fopen("/spiffs/log.bin", "wb+");
                 if (LogFile == NULL)
                 {
-                    printf("Failed to clear log file!\n");
-                    break;
+                    printf("e0\n");
                 }
                 g_BytesWrittenToFile = 0;
-                printf("Log file cleared.\n");
-                break;
+                AmountOfEntries = 0;
+                printf("s1\n");
+            }
+            // Index
+            else if (Command[0] == 'i')
+            {
+                printf("i%u\n", AmountOfEntries);
+            }
+            // seT time
+            else if (Command[0] == 't')
+            {
+                unsigned long long Epoch;
+                if (sscanf((char*)Command + 1, "%llu", &Epoch) == 1)
+                {
+                    Epoch = Epoch / 1000;
+                    struct tm t;
+                    t.tm_year = (Epoch / 31536000) + 70;
+                    t.tm_mon = ((Epoch % 31536000) / 2592000);
+                    t.tm_mday = ((Epoch % 2592000) / 86400);
+                    t.tm_hour = ((Epoch % 86400) / 3600);
+                    t.tm_min = ((Epoch % 3600) / 60);
+                    t.tm_sec = (Epoch % 60);
+                    t.tm_isdst = -1;
+
+                    Rtc.Epoch = Epoch;
+
+                    uint8_t buffer[8];
+                    buffer[0] = 0;
+                    buffer[1] = BinaryToBcd(t.tm_sec);
+                    buffer[2] = BinaryToBcd(t.tm_min);
+                    buffer[3] = BinaryToBcd(t.tm_hour);
+                    buffer[4] = 0;
+                    buffer[5] = BinaryToBcd(t.tm_mday);
+                    buffer[6] = BinaryToBcd(t.tm_mon + 1);
+                    buffer[7] = BinaryToBcd(t.tm_year - 100);
+
+                    ESP_ERROR_CHECK(i2c_master_transmit(Rtc.hDevice, buffer, sizeof(buffer), -1));
+                    
+                    printf("s1\n");
+                }
+                else
+                {
+                    printf("e0e0e0\n");
+                }
+            }
+            // List
+            else if (Command[0] == 'l')
+            {
+                fseek(LogFile, 0, SEEK_SET);
+                unsigned char BufferToWrite[16];
+                printf("i%u\n", AmountOfEntries);
+                for (unsigned int i = 0; i < AmountOfEntries && i < 201; i++)
+                {
+                    fread(BufferToWrite, sizeof(BufferToWrite[0]), sizeof(BufferToWrite), LogFile);
+                    unsigned long long Timestamp = *((unsigned long long*)(BufferToWrite));
+                    float Temperature = *((float*)(BufferToWrite + 8));
+                    float Humidity = *((float*)(BufferToWrite + 12));
+
+                    printf("t%llup%.3fh%.3f\n", Timestamp, Temperature, Humidity);
+                }
+            }
+            // statUs
+            else if (Command[0] == 'u')
+            {
+                printf("a0\n");
             }
             else
             {
-                printf("Unknown command: %s\n> ", Command);
+                printf("e-1e-1e-1\n");
             }
         }
     }
