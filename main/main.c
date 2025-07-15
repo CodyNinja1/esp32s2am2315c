@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
 #include "esp_mac.h"
+#include "esp_sleep.h"
 #include "esp_spiffs.h"
 
 #define TEMP_I2C_SDA 20
@@ -34,8 +35,9 @@ typedef struct
 } RtcDevice;
 
 uint32_t g_BytesWrittenToFile = 0;
-i2c_master_bus_handle_t hBusTemperature;
-i2c_master_bus_handle_t hBusRtc;
+bool g_DoneWriting = false;
+i2c_master_bus_handle_t g_hBusTemperature;
+i2c_master_bus_handle_t g_hBusRtc;
 
 bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t Address)
 {
@@ -46,7 +48,7 @@ bool bInitTemperatureSensor(TemperatureSensor* Sensor, uint8_t Address)
         .scl_speed_hz = 100000
     };
 
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(hBusTemperature, &DeviceConfig, &(Sensor->hDevice)));
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_hBusTemperature, &DeviceConfig, &(Sensor->hDevice)));
     
     uint8_t Status = 0;
     Status = 0x71;
@@ -68,7 +70,7 @@ bool bInitRtcDevice(RtcDevice* Rtc, uint8_t Address)
         .scl_speed_hz = 100000
     };
 
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(hBusRtc, &DeviceConfig, &(Rtc->hDevice)));
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_hBusRtc, &DeviceConfig, &(Rtc->hDevice)));
 
     return true;
 }
@@ -208,7 +210,7 @@ void app_main(void)
     TemperatureSensor Sensor;
     RtcDevice Rtc;
 
-    vInitI2CBus(TEMP_I2C_SCL, TEMP_I2C_SDA, &hBusTemperature);
+    vInitI2CBus(TEMP_I2C_SCL, TEMP_I2C_SDA, &g_hBusTemperature);
 
     bool TempInitStatus = bInitTemperatureSensor(&Sensor, TEMP_ADR);
     if (!TempInitStatus)
@@ -224,7 +226,7 @@ void app_main(void)
         printf("s0t\n");
     }
 
-    vInitI2CBus(RTC_I2C_SCL, RTC_I2C_SDA, &hBusRtc);
+    vInitI2CBus(RTC_I2C_SCL, RTC_I2C_SDA, &g_hBusRtc);
 
     bool RtcInitStatus = bInitRtcDevice(&Rtc, RTC_ADR);
     if (!RtcInitStatus)
@@ -247,6 +249,8 @@ void app_main(void)
     {
         while (1)
         {
+            esp_sleep_enable_timer_wakeup(5000000);
+
             struct timeval Now;
             _gettimeofday_r(NULL, &Now, NULL);
 
@@ -281,6 +285,8 @@ void app_main(void)
             {
                 printf("i%lu\n", g_BytesWrittenToFile / 16);
             }
+
+            esp_light_sleep_start();
         }
     }
     else
@@ -436,8 +442,8 @@ void app_main(void)
 
     vDestroyTemperatureSensor(&Sensor);
     vDestroyRtcDevice(&Rtc);
-    vDestroyI2CBus(hBusRtc);
-    vDestroyI2CBus(hBusTemperature);
+    vDestroyI2CBus(g_hBusRtc);
+    vDestroyI2CBus(g_hBusTemperature);
     fclose(LogFile);
     esp_vfs_spiffs_unregister(NULL);
 }
